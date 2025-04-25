@@ -34,12 +34,15 @@ import (
 
 // https://www.keba.com/en/emobility/service-support/downloads/Downloads
 // https://www.keba.com/download/x/dea7ae6b84/kecontactp30modbustcp_pgen.pdf
+// https://www.keba.com/download/x/4a24e19f80/kecontactp40modbustcp_pgen.pdf
 
 // Keba is an api.Charger implementation
 type Keba struct {
 	*embed
-	log  *util.Logger
-	conn *modbus.Connection
+	log           *util.Logger
+	conn          *modbus.Connection
+	lastCurrent   uint16 // last set current
+	productFamily byte
 }
 
 const (
@@ -101,13 +104,28 @@ func NewKebaFromConfig(ctx context.Context, other map[string]interface{}) (api.C
 		return nil, err
 	}
 
-	if features := binary.BigEndian.Uint32(b); (features/10)%10 > 0 {
+	productCode := binary.BigEndian.Uint32(b)
+
+	// index for P30/P40
+	// [0]: product family
+	// [1]: device current, for P30 this is in [2]
+	// [2]: connector (cable/sockel) for P30 this is in [1]
+	// [3]: phases, for P30: device series
+	// [4]: metering
+	// [5]: authorization (rfid)
+	// [6]: button (new for P40)
+	productCodeStr := fmt.Sprintf("%d", productCode)
+
+	wb.productFamily = productCodeStr[0] // 3: P30, 4: P40
+	wb.log.INFO.Printf("product code: %s\n", string(wb.productFamily))
+
+	if productCodeStr[4] != '0' { // metering
 		currentPower = wb.currentPower
 		totalEnergy = wb.totalEnergy
 		currents = wb.currents
 	}
 
-	if features := binary.BigEndian.Uint32(b); features%10 > 0 {
+	if productCodeStr[5] == '1' { // authorization
 		identify = wb.identify
 		reason = wb.statusReason
 	}
@@ -247,11 +265,25 @@ func (wb *Keba) Enabled() (bool, error) {
 // Enable implements the api.Charger interface
 func (wb *Keba) Enable(enable bool) error {
 	var u uint16
-	if enable {
-		u = 1
+
+	if wb.productFamily == '4' { // P40
+		if enable {
+			u = wb.lastCurrent
+			if u == 0 {
+				u = 6000 // fallback 6A
+			}
+		} else {
+			u = 0 // 0: suspends current charging session
+		}
+		_, err := wb.conn.WriteSingleRegister(kebaRegMaxCurrent, u)
+		return err
+	} else { // P30
+		if enable {
+			u = 1
+		}
+		_, err := wb.conn.WriteSingleRegister(kebaRegEnable, u)
+		return err
 	}
-	_, err := wb.conn.WriteSingleRegister(kebaRegEnable, u)
-	return err
 }
 
 // MaxCurrent implements the api.Charger interface
@@ -264,6 +296,7 @@ var _ api.ChargerEx = (*Keba)(nil)
 // MaxCurrentMillis implements the api.ChargerEx interface
 func (wb *Keba) MaxCurrentMillis(current float64) error {
 	u := uint16(current * 1000)
+	wb.lastCurrent = u
 	_, err := wb.conn.WriteSingleRegister(kebaRegMaxCurrent, u)
 	return err
 }
